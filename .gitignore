@@ -1,0 +1,15 @@
+# Go build and test artifacts
+/codex-usage
+*.test
+*.out
+coverage.*
+
+# Workspace and OS files
+.vscode/
+.idea/
+.DS_Store
+
+# Local environment files
+.env
+.env.*
+!.env.example
