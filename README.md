@@ -1,20 +1,46 @@
-# Codex usage sidecar
+# LiteLLM usage sidecar
 
-Small, stateless REST and Streamable HTTP MCP service for the ChatGPT Codex allowance endpoint.
+Small, stateless REST and Streamable HTTP MCP service for provider-specific model usage endpoints. The built-in default uses LiteLLM's `openai` provider and the ChatGPT Codex allowance endpoint.
 
 ## Endpoints
 
 - `GET /health`
 - `GET /v1/usage`
+- `GET /v1/usage/{model_id}`
 - `POST /mcp`
 
-`/v1/usage` and `/mcp` require `X-Internal-API-Key`. The health endpoint intentionally does not.
+`/v1/usage`, `/v1/usage/{model_id}`, and `/mcp` require `X-Internal-API-Key`. The health endpoint intentionally does not.
 
-The service reads `/tokens/auth.json` on every uncached retrieval so token refreshes are picked up without restarting. Successful responses are cached for 30 seconds by default, with concurrent cache misses coalesced into one upstream request.
+`GET /v1/usage` returns an array of configured provider plans. Each entry includes the explicit LiteLLM-to-provider model mappings and the current usage data for that plan:
+
+```json
+[
+	{
+		"provider": "openai",
+		"plan": "openai_plan_01",
+		"models": [
+			{"litellm_name": "oai-gpt-5.5"},
+			{"litellm_name": "oai-gpt-5.6-luna"}
+		],
+		"usage_path": "/v1/usage/{model_id}",
+		"usage": {
+			"provider": "openai",
+			"usage_plan_name": "openai_plan_01",
+			"plan_type": "pro",
+			"allowed": true,
+			"limit_reached": false
+		}
+	}
+]
+```
+
+`GET /v1/usage/{model_id}` resolves the LiteLLM model name to its configured plan, fetches that plan's usage endpoint, and returns the focused normalized usage response with `model_id`, `provider`, and `usage_plan_name` metadata. Unknown model names return `404`.
+
+The service reads each plan's `auth_file` on every uncached retrieval so token refreshes are picked up without restarting. The last successful response is cached in memory for 60 seconds by default per provider plan endpoint. Requests for multiple LiteLLM model names that resolve to the same plan reuse that response; expired entries trigger a fresh provider request. Set `CACHE_TTL_SECONDS` to change the cache duration.
 
 ## Usage response
 
-Example response observed while the account-wide five-hour restriction is temporarily disabled:
+Example normalized response:
 
 ```json
 {
@@ -43,54 +69,59 @@ Example response observed while the account-wide five-hour restriction is tempor
 }
 ```
 
-The meaning of `primary` is determined by the upstream window duration, not by its name in this normalized response. During the temporary promotion, the upstream account response can omit the 18,000-second window and return only the 604,800-second weekly window. In that case the weekly window appears as `primary` and `secondary` is omitted.
+The meaning of `primary` is determined by the upstream window duration, not by its name in this normalized response. Provider-specific endpoint behavior, expected upstream response shapes, and normalization rules are documented under [Providers](#providers).
 
-Tibo announced that OpenAI was temporarily removing the five-hour usage restriction for Plus, Business, and Pro plans. Search-indexed copies of the announcement also report weekly limits being 50% higher through July 19. Treat this as a temporary server-side policy rather than a stable API contract. See [Tibo's posts and replies](https://x.com/thsottiaux/with_replies) and the [current Codex pricing documentation](https://learn.chatgpt.com/docs/pricing).
+## Providers
 
-When the normal five-hour plus weekly policy returns, the sidecar is expected to emit both windows:
+The sidecar currently implements two providers; their endpoint behavior, expected upstream response shapes, and normalization rules are documented individually:
 
-```json
-{
-	"plan_type": "pro",
-	"allowed": true,
-	"limit_reached": false,
-	"primary": {
-		"used_percent": 22,
-		"remaining_percent": 78,
-		"resets_at": "2026-07-13T05:00:00Z"
-	},
-	"secondary": {
-		"used_percent": 43,
-		"remaining_percent": 57,
-		"resets_at": "2026-07-19T14:00:00Z"
-	},
-	"retrieved_at": "2026-07-13T00:00:00Z"
-}
-```
+- [docs/openai.md](docs/openai.md) — ChatGPT Codex WHAM usage endpoint.
+- [docs/zai.md](docs/zai.md) — GLM Coding Plan quota monitor endpoint.
 
-The corresponding upstream `wham/usage` shape uses window durations to identify each limit:
+## Provider plans
+
+Edit `config/providers.json` to configure providers and multiple plans. A provider can have multiple plans, and each plan owns its own identity (`auth_file`) and model entries. Each model entry is intentionally an object containing LiteLLM's public `model_name` as `litellm_name`, leaving room for future model-specific metadata. No provider model ID is required because the WHAM response reports account-wide usage rather than per-model limits, and wildcard entries are not supported. There is no separate plan ID: the provider and plan name identify a configured usage source, and each LiteLLM model name must appear in at most one plan. Provider endpoint behavior is built into the sidecar, so changing provider URLs is not required for the supported provider implementation:
 
 ```json
 {
-	"plan_type": "pro",
-	"rate_limit": {
-		"allowed": true,
-		"limit_reached": false,
-		"primary_window": {
-			"used_percent": 22,
-			"reset_at": 1783904400,
-			"limit_window_seconds": 18000
+	"plans": [
+		{
+			"provider": "openai",
+			"plan": "openai_plan_01",
+			"models": [
+				{"litellm_name": "oai-gpt-5.5"},
+				{"litellm_name": "oai-gpt-5.6-luna"}
+			],
+			"auth_file": "/tokens/openai-default.json"
 		},
-		"secondary_window": {
-			"used_percent": 43,
-			"reset_at": 1784450400,
-			"limit_window_seconds": 604800
+		{
+			"provider": "openai",
+			"plan": "openai_plan_02",
+			"models": [
+				{"litellm_name": "oai-gpt-5.6-sol"}
+			],
+			"auth_file": "/tokens/openai-team.json"
 		}
-	}
+	]
 }
 ```
 
-In the usual upstream schema, `18000` seconds is the five-hour session window and `604800` seconds is the weekly window. This shape is also covered by the open-source [CodexBar Codex OAuth documentation](https://github.com/steipete/CodexBar/blob/main/docs/codex-oauth.md) and its parser tests. The upstream endpoint is undocumented and may change without notice; consumers should tolerate either window being absent.
+Provider values should be LiteLLM provider IDs. The sidecar currently implements `openai` and `zai`; provider-specific endpoint behavior is built into the sidecar, while plan identities and LiteLLM model mappings are user configuration. The OpenAI adapter is in `provider_openai.go` and the z.ai adapter is in `provider_zai.go`.
+
+`plan_details_path` is returned as provider metadata for consumers that need to build a provider-specific plan-details request. It is controlled by the built-in provider adapter rather than the editable plan file. The sidecar currently fetches usage only; it does not fetch or proxy plan details separately.
+
+## Layout
+
+```
+main.go               # HTTP server, MCP handler, usage service, config loading, normalization
+provider.go           # provider adapter interface and dispatch
+provider_openai.go    # OpenAI (ChatGPT Codex WHAM) adapter
+provider_zai.go       # z.ai (GLM Coding Plan quota) adapter
+config/providers.json # provider/plan/model configuration
+docs/                 # per-provider documentation (endpoints, response shapes, normalization)
+```
+
+Tests mirror this layout: `main_test.go` covers routing, config, and the MCP handler; `provider_openai_test.go` and `provider_zai_test.go` cover the adapter fetch paths.
 
 ## LiteLLM rollout
 
@@ -125,3 +156,10 @@ mcp_servers:
 ```
 
 Then add a `codex-usage` healthy dependency to `litellm`, recreate only the LiteLLM container, and verify `/codex-usage/v1/usage` plus the `codex_usage_mcp` tool through LiteLLM authentication.
+
+## Environment
+
+- `INTERNAL_API_KEY` is required for authenticated endpoints.
+- `PROVIDER_CONFIG_FILE` defaults to `/config/providers.json`.
+- `CACHE_TTL_SECONDS` defaults to `60` seconds and controls the in-memory provider response cache.
+- `UPSTREAM_TIMEOUT_SECONDS` defaults to `10`.

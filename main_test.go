@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,17 +11,16 @@ import (
 	"time"
 )
 
-func TestRetrieveNormalizesAndCachesUsage(t *testing.T) {
+func TestUsagePlansAndModelRouting(t *testing.T) {
 	t.Parallel()
 
-	var calls int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		if r.Header.Get("Authorization") != "Bearer token" || r.Header.Get("ChatGPT-Account-Id") != "account" {
-			t.Fatal("upstream credentials missing")
-		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":36,"reset_at":1783918800},"secondary_window":{"used_percent":14,"reset_at":1784479200}}}`))
+		planType := "openai-plan"
+		if r.URL.Path == "/anthropic" {
+			planType = "anthropic-plan"
+		}
+		_, _ = w.Write([]byte(`{"plan_type":"` + planType + `","rate_limit":{"allowed":true,"limit_reached":false}}`))
 	}))
 	defer upstream.Close()
 
@@ -31,17 +29,74 @@ func TestRetrieveNormalizesAndCachesUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	svc := newUsageService(authPath, upstream.URL, time.Minute, upstream.Client())
-	first, err := svc.retrieve(context.Background())
+	service := newUsageServiceWithPlans([]planConfig{
+		{Provider: "openai", Plan: "openai_plan_01", Models: []modelMapping{{LiteLLMName: "openai/gpt-5-codex"}}, UsageURL: upstream.URL + "/openai", AuthFile: authPath},
+		{Provider: "openai", Plan: "openai_plan_02", Models: []modelMapping{{LiteLLMName: "openai/team"}}, UsageURL: upstream.URL + "/team", AuthFile: authPath},
+	}, time.Minute, upstream.Client())
+	handler := newHandler("secret", service)
+
+	plansRequest := httptest.NewRequest(http.MethodGet, "/v1/usage", nil)
+	plansRequest.Header.Set("X-Internal-API-Key", "secret")
+	plansResult := httptest.NewRecorder()
+	handler.ServeHTTP(plansResult, plansRequest)
+	var plans usagePlansResponse
+	if err := json.Unmarshal(plansResult.Body.Bytes(), &plans); err != nil {
+		t.Fatal(err)
+	}
+	if plansResult.Code != http.StatusOK || len(plans) != 2 || plans[0].Provider != "openai" || plans[0].Usage.PlanType != "openai-plan" || plans[1].Models[0].LiteLLMName != "openai/team" || plans[1].Usage.Provider != "openai" {
+		t.Fatalf("unexpected plans response: status=%d body=%s", plansResult.Code, plansResult.Body.String())
+	}
+
+	modelRequest := httptest.NewRequest(http.MethodGet, "/v1/usage/openai/team", nil)
+	modelRequest.Header.Set("X-Internal-API-Key", "secret")
+	modelResult := httptest.NewRecorder()
+	handler.ServeHTTP(modelResult, modelRequest)
+	var usage usageResponse
+	if err := json.Unmarshal(modelResult.Body.Bytes(), &usage); err != nil {
+		t.Fatal(err)
+	}
+	if modelResult.Code != http.StatusOK || usage.ModelID != "openai/team" || usage.Provider != "openai" {
+		t.Fatalf("unexpected model response: status=%d body=%s", modelResult.Code, modelResult.Body.String())
+	}
+
+	unknownRequest := httptest.NewRequest(http.MethodGet, "/v1/usage/unknown/model", nil)
+	unknownRequest.Header.Set("X-Internal-API-Key", "secret")
+	unknownResult := httptest.NewRecorder()
+	handler.ServeHTTP(unknownResult, unknownRequest)
+	if unknownResult.Code != http.StatusNotFound {
+		t.Fatalf("unknown model status=%d body=%s", unknownResult.Code, unknownResult.Body.String())
+	}
+}
+
+func TestValidateProvidersConfigRejectsUnknownProvider(t *testing.T) {
+	t.Parallel()
+
+	err := validateProvidersConfig(providersConfig{Plans: []planConfig{{
+		Provider: "custom_provider", Plan: "standard", Models: []modelMapping{{LiteLLMName: "custom/model"}}, AuthFile: "/tokens/custom.json",
+	}}})
+	if err == nil || !strings.Contains(err.Error(), "no built-in definition") {
+		t.Fatalf("expected unknown provider error, got %v", err)
+	}
+}
+
+func TestLoadProviderConfigAndMultiplePlans(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "providers.json")
+	configJSON := `{"plans":[{"provider":"openai","plan":"openai_plan_01","models":[{"litellm_name":"openai/free"}],"auth_file":"/tokens/free.json"},{"provider":"openai","plan":"openai_plan_02","models":[{"litellm_name":"openai/team"}],"auth_file":"/tokens/team.json"}]}`
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := loadProviderConfig(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := svc.retrieve(context.Background())
+	plans, err := loadPlans(config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls != 1 || first.Primary == nil || first.Primary.RemainingPercent != 64 || second.PlanType != "pro" {
-		t.Fatalf("unexpected result: calls=%d first=%+v second=%+v", calls, first, second)
+	if len(plans) != 2 || plans[0].Provider != "openai" || plans[1].Plan != "openai_plan_02" || plans[1].Models[0].LiteLLMName != "openai/team" || plans[1].AuthFile != "/tokens/team.json" {
+		t.Fatalf("unexpected plans: %+v", plans)
 	}
 }
 

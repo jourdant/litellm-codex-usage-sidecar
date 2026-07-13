@@ -10,17 +10,25 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	defaultAuthFile = "/tokens/auth.json"
-	defaultUsageURL = "https://chatgpt.com/backend-api/wham/usage"
-	protocolVersion = "2025-11-25"
+	protocolVersion           = "2025-11-25"
+	defaultProviderConfigFile = "/config/providers.json"
+	defaultCacheTTL           = 60 * time.Second
 )
+
+var errUnknownModel = errors.New("unknown model")
+
+type providersConfig struct {
+	Plans []planConfig `json:"plans"`
+}
 
 type authFile struct {
 	AccessToken string `json:"access_token"`
@@ -67,6 +75,9 @@ type usageLimit struct {
 }
 
 type usageResponse struct {
+	ModelID          string       `json:"model_id,omitempty"`
+	Provider         string       `json:"provider,omitempty"`
+	UsagePlanName    string       `json:"usage_plan_name,omitempty"`
 	PlanType         string       `json:"plan_type"`
 	Allowed          bool         `json:"allowed"`
 	LimitReached     bool         `json:"limit_reached"`
@@ -76,79 +87,268 @@ type usageResponse struct {
 	RetrievedAt      string       `json:"retrieved_at"`
 }
 
+type usagePlan struct {
+	Provider        string         `json:"provider"`
+	Plan            string         `json:"plan"`
+	Models          []modelMapping `json:"models"`
+	UsagePath       string         `json:"usage_path"`
+	PlanDetailsPath string         `json:"plan_details_path,omitempty"`
+	Usage           usageResponse  `json:"usage"`
+}
+
+type usagePlansResponse []usagePlan
+
 type cacheEntry struct {
 	value   usageResponse
 	expires time.Time
 }
 
+type modelMapping struct {
+	LiteLLMName string `json:"litellm_name"`
+}
+
+type planConfig struct {
+	Provider string         `json:"provider"`
+	Plan     string         `json:"plan"`
+	Models   []modelMapping `json:"models"`
+	AuthFile string         `json:"auth_file"`
+
+	UsageURL        string `json:"-"`
+	PlanDetailsPath string `json:"-"`
+}
+
 type usageService struct {
-	authFile string
-	usageURL string
-	ttl      time.Duration
-	client   *http.Client
-	mu       sync.Mutex
-	cache    *cacheEntry
+	plans  []planConfig
+	ttl    time.Duration
+	client *http.Client
+	mu     sync.Mutex
+	caches map[string]*cacheEntry
+	cache  *cacheEntry
 }
 
 func newUsageService(authFilePath, usageURL string, ttl time.Duration, client *http.Client) *usageService {
-	return &usageService{authFile: authFilePath, usageURL: usageURL, ttl: ttl, client: client}
+	return newUsageServiceWithPlans([]planConfig{{
+		Provider: "openai", Plan: "openai_plan_01", Models: []modelMapping{{
+			LiteLLMName: "oai-gpt-5.5",
+		}},
+		UsageURL: usageURL, AuthFile: authFilePath,
+	}}, ttl, client)
 }
 
-func (s *usageService) retrieve(ctx context.Context) (usageResponse, error) {
+func newUsageServiceWithPlans(plans []planConfig, ttl time.Duration, client *http.Client) *usageService {
+	if ttl <= 0 {
+		ttl = defaultCacheTTL
+	}
+	return &usageService{plans: plans, ttl: ttl, client: client, caches: make(map[string]*cacheEntry)}
+}
+
+func (s *usageService) retrieve(ctx context.Context, modelIDs ...string) (usageResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.cache != nil && time.Now().Before(s.cache.expires) {
-		return s.cache.value, nil
+	modelID := ""
+	if len(modelIDs) > 0 && modelIDs[0] != "" {
+		modelID = modelIDs[0]
 	}
-
-	value, err := s.fetch(ctx)
+	plan, err := s.planForModel(modelID)
 	if err != nil {
 		return usageResponse{}, err
 	}
-	s.cache = &cacheEntry{value: value, expires: time.Now().Add(s.ttl)}
+	value, err := s.retrievePlanLocked(ctx, plan)
+	if err != nil {
+		return usageResponse{}, err
+	}
+	value.ModelID = modelID
 	return value, nil
 }
 
-func (s *usageService) fetch(ctx context.Context) (usageResponse, error) {
-	contents, err := os.ReadFile(s.authFile)
+func (s *usageService) retrievePlanLocked(ctx context.Context, plan planConfig) (usageResponse, error) {
+	if s.caches == nil {
+		s.caches = make(map[string]*cacheEntry)
+	}
+
+	cacheKey := planCacheKey(plan)
+	if cache := s.caches[cacheKey]; cache != nil && time.Now().Before(cache.expires) {
+		return cache.value, nil
+	}
+
+	value, err := s.fetch(ctx, plan)
 	if err != nil {
-		return usageResponse{}, fmt.Errorf("read auth file: %w", err)
+		return usageResponse{}, err
 	}
+	s.caches[cacheKey] = &cacheEntry{value: value, expires: time.Now().Add(s.ttl)}
+	return value, nil
+}
 
-	var auth authFile
-	if err := json.Unmarshal(contents, &auth); err != nil {
-		return usageResponse{}, fmt.Errorf("parse auth file: %w", err)
+func (s *usageService) planForModel(modelID string) (planConfig, error) {
+	if modelID == "" {
+		return planConfig{}, fmt.Errorf("%w: model ID is required", errUnknownModel)
 	}
-	if auth.AccessToken == "" || auth.AccountID == "" {
-		return usageResponse{}, errors.New("auth file is missing access_token or account_id")
+	for _, plan := range s.plans {
+		for _, model := range plan.Models {
+			if model.LiteLLMName == modelID {
+				return plan, nil
+			}
+		}
 	}
+	return planConfig{}, fmt.Errorf("%w %q", errUnknownModel, modelID)
+}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.usageURL, nil)
+func (s *usageService) plansResponse(ctx context.Context) (usagePlansResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	plans := make([]usagePlan, 0, len(s.plans))
+	for _, plan := range s.plans {
+		models := append([]modelMapping(nil), plan.Models...)
+		usage, err := s.retrievePlanLocked(ctx, plan)
+		if err != nil {
+			return nil, err
+		}
+		plans = append(plans, usagePlan{
+			Provider: planProvider(plan), Plan: plan.Plan, Models: models,
+			UsagePath: "/v1/usage/{model_id}", PlanDetailsPath: plan.PlanDetailsPath,
+			Usage: usage,
+		})
+	}
+	return usagePlansResponse(plans), nil
+}
+
+func planProvider(plan planConfig) string {
+	return strings.ToLower(strings.TrimSpace(plan.Provider))
+}
+
+func planCacheKey(plan planConfig) string {
+	return strings.Join([]string{planProvider(plan), plan.Plan, plan.UsageURL, plan.AuthFile}, "\x00")
+}
+
+func (s *usageService) fetch(ctx context.Context, plan planConfig) (usageResponse, error) {
+	auth, err := readAuthFile(plan.AuthFile)
 	if err != nil {
-		return usageResponse{}, fmt.Errorf("create usage request: %w", err)
+		return usageResponse{}, err
 	}
-	req.Header.Set("Authorization", "Bearer "+auth.AccessToken)
-	req.Header.Set("ChatGPT-Account-Id", auth.AccountID)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "codex-usage-sidecar/1")
+	provider, ok := providerAdapterFor(plan.Provider)
+	if !ok {
+		return usageResponse{}, fmt.Errorf("provider %q has no built-in adapter", plan.Provider)
+	}
+	return provider.fetch(ctx, s.client, plan, auth)
+}
 
-	response, err := s.client.Do(req)
+func loadProviderConfig(path string) (providersConfig, error) {
+	contents, err := os.ReadFile(path)
 	if err != nil {
-		return usageResponse{}, fmt.Errorf("request usage: %w", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-		return usageResponse{}, fmt.Errorf("usage endpoint returned HTTP %d", response.StatusCode)
+		return providersConfig{}, fmt.Errorf("read provider config: %w", err)
 	}
 
-	var upstream upstreamUsage
-	decoder := json.NewDecoder(io.LimitReader(response.Body, 1<<20))
-	if err := decoder.Decode(&upstream); err != nil {
-		return usageResponse{}, fmt.Errorf("decode usage response: %w", err)
+	var config providersConfig
+	if err := json.Unmarshal(contents, &config); err != nil {
+		return providersConfig{}, fmt.Errorf("parse provider config: %w", err)
 	}
-	return normalizeUsage(upstream, time.Now().UTC()), nil
+	if err := validateProvidersConfig(config); err != nil {
+		return providersConfig{}, fmt.Errorf("validate provider config: %w", err)
+	}
+	return config, nil
+}
+
+func validateProvidersConfig(config providersConfig) error {
+	if len(config.Plans) == 0 {
+		return errors.New("at least one plan is required")
+	}
+	modelOwners := make(map[string]string)
+	for _, plan := range config.Plans {
+		provider := planProvider(plan)
+		if provider == "" {
+			return errors.New("each plan requires provider")
+		}
+		if _, ok := providerAdapterFor(provider); !ok {
+			return fmt.Errorf("provider %q has no built-in definition", provider)
+		}
+		if plan.Plan == "" {
+			return fmt.Errorf("plan for provider %q requires plan", provider)
+		}
+		if plan.AuthFile == "" {
+			return fmt.Errorf("plan %q requires auth_file", plan.Plan)
+		}
+		if len(plan.Models) == 0 {
+			return fmt.Errorf("plan %q must list at least one model", plan.Plan)
+		}
+		for _, model := range plan.Models {
+			if model.LiteLLMName == "" {
+				return fmt.Errorf("plan %q requires litellm_name for every model", plan.Plan)
+			}
+			if owner, exists := modelOwners[model.LiteLLMName]; exists {
+				return fmt.Errorf("model %q is assigned to plans %q and %q", model.LiteLLMName, owner, plan.Plan)
+			}
+			modelOwners[model.LiteLLMName] = plan.Plan
+		}
+	}
+	return nil
+}
+
+func loadPlans(config providersConfig) ([]planConfig, error) {
+	if err := validateProvidersConfig(config); err != nil {
+		return nil, err
+	}
+	for index := range config.Plans {
+		provider := planProvider(config.Plans[index])
+		adapter, ok := providerAdapterFor(provider)
+		if !ok {
+			return nil, fmt.Errorf("provider %q has no built-in definition", provider)
+		}
+		definition := adapter.definition()
+		config.Plans[index].Provider = provider
+		config.Plans[index].UsageURL = definition.UsageURL
+		config.Plans[index].PlanDetailsPath = definition.PlanDetailsPath
+	}
+	if err := validatePlans(config.Plans); err != nil {
+		return nil, err
+	}
+	return config.Plans, nil
+}
+
+func validatePlans(plans []planConfig) error {
+	if len(plans) == 0 {
+		return errors.New("at least one plan is required")
+	}
+
+	planKeys := make(map[string]struct{}, len(plans))
+	modelOwners := make(map[string]string)
+	for _, plan := range plans {
+		if plan.Provider == "" {
+			return errors.New("each plan requires provider")
+		}
+		if _, ok := providerAdapterFor(planProvider(plan)); !ok {
+			return fmt.Errorf("provider %q has no built-in definition", plan.Provider)
+		}
+		if plan.Plan == "" {
+			return fmt.Errorf("plan for provider %q requires plan", plan.Provider)
+		}
+		if plan.AuthFile == "" {
+			return fmt.Errorf("plan %q requires auth_file because provider %q has no built-in auth file", plan.Plan, plan.Provider)
+		}
+		planKey := planCacheKey(plan)
+		if _, exists := planKeys[planKey]; exists {
+			return fmt.Errorf("duplicate provider plan source %q/%q", plan.Provider, plan.Plan)
+		}
+		planKeys[planKey] = struct{}{}
+		parsedURL, err := url.Parse(plan.UsageURL)
+		if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+			return fmt.Errorf("plan %q has invalid usage_url", plan.Plan)
+		}
+		if len(plan.Models) == 0 {
+			return fmt.Errorf("plan %q must list at least one model", plan.Plan)
+		}
+		for _, model := range plan.Models {
+			if model.LiteLLMName == "" {
+				return fmt.Errorf("plan %q requires litellm_name for every model", plan.Plan)
+			}
+			if owner, exists := modelOwners[model.LiteLLMName]; exists {
+				return fmt.Errorf("model %q is assigned to plans %q and %q", model.LiteLLMName, owner, plan.Plan)
+			}
+			modelOwners[model.LiteLLMName] = plan.Plan
+		}
+	}
+	return nil
 }
 
 func normalizeUsage(upstream upstreamUsage, retrievedAt time.Time) usageResponse {
@@ -207,14 +407,27 @@ func newHandler(internalKey string, service *usageService) http.Handler {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("GET /v1/usage", authenticate(internalKey, func(w http.ResponseWriter, r *http.Request) {
-		usage, err := service.retrieve(r.Context())
+	mux.HandleFunc("GET /v1/usage/{model_id...}", authenticate(internalKey, func(w http.ResponseWriter, r *http.Request) {
+		usage, err := service.retrieve(r.Context(), r.PathValue("model_id"))
 		if err != nil {
+			if errors.Is(err, errUnknownModel) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+				return
+			}
 			slog.Error("usage retrieval failed", "error", err)
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "usage retrieval failed"})
 			return
 		}
 		writeJSON(w, http.StatusOK, usage)
+	}))
+	mux.HandleFunc("GET /v1/usage", authenticate(internalKey, func(w http.ResponseWriter, r *http.Request) {
+		plans, err := service.plansResponse(r.Context())
+		if err != nil {
+			slog.Error("plan usage retrieval failed", "error", err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "usage retrieval failed"})
+			return
+		}
+		writeJSON(w, http.StatusOK, plans)
 	}))
 	mux.HandleFunc("POST /mcp", authenticate(internalKey, func(w http.ResponseWriter, r *http.Request) {
 		handleMCP(w, r, service)
@@ -268,7 +481,7 @@ func handleMCP(w http.ResponseWriter, r *http.Request, service *usageService) {
 			writeRPC(w, request.ID, nil, &rpcError{Code: -32602, Message: "Invalid params"})
 			return
 		}
-		usage, err := service.retrieve(r.Context())
+		usage, err := service.retrieve(r.Context(), "")
 		if err != nil {
 			slog.Error("MCP usage retrieval failed", "error", err)
 			writeRPC(w, request.ID, map[string]any{"isError": true, "content": []any{map[string]string{"type": "text", "text": "Usage retrieval failed"}}}, nil)
@@ -336,17 +549,23 @@ func main() {
 		slog.Error("INTERNAL_API_KEY is required")
 		os.Exit(1)
 	}
-	authPath := os.Getenv("CHATGPT_AUTH_FILE")
-	if authPath == "" {
-		authPath = defaultAuthFile
+	configPath := os.Getenv("PROVIDER_CONFIG_FILE")
+	if configPath == "" {
+		configPath = defaultProviderConfigFile
 	}
-	usageURL := os.Getenv("CHATGPT_USAGE_URL")
-	if usageURL == "" {
-		usageURL = defaultUsageURL
+	config, err := loadProviderConfig(configPath)
+	if err != nil {
+		slog.Error("invalid provider configuration", "error", err)
+		os.Exit(1)
+	}
+	plans, err := loadPlans(config)
+	if err != nil {
+		slog.Error("invalid provider plan configuration", "error", err)
+		os.Exit(1)
 	}
 
 	client := &http.Client{Timeout: envDuration("UPSTREAM_TIMEOUT_SECONDS", 10*time.Second)}
-	service := newUsageService(authPath, usageURL, envDuration("CACHE_TTL_SECONDS", 30*time.Second), client)
+	service := newUsageServiceWithPlans(plans, envDuration("CACHE_TTL_SECONDS", defaultCacheTTL), client)
 	server := &http.Server{
 		Addr:              ":8080",
 		Handler:           newHandler(internalKey, service),

@@ -1,0 +1,42 @@
+{
+    "plans": [
+        {
+            "provider": "openai",
+            "plan": "openai_plan_01",
+            "models": [
+                {
+                    "litellm_name": "oai-gpt-5.5"
+                },
+                {
+                    "litellm_name": "oai-gpt-5.6-luna"
+                },
+                {
+                    "litellm_name": "oai-gpt-5.6-sol"
+                },
+                {
+                    "litellm_name": "oai-gpt-5.6-terra"
+                },
+                {
+                    "litellm_name": "oai-gpt-5.4"
+                }
+            ],
+            "auth_file": "/tokens/auth.json"
+        },
+        {
+            "provider": "zai",
+            "plan": "zai_plan_01",
+            "models": [
+                {
+                    "litellm_name": "glm-5.2"
+                },
+                {
+                    "litellm_name": "glm-5-turbo"
+                },
+                {
+                    "litellm_name": "glm-4.7"
+                }
+            ],
+            "auth_file": "/tokens/zai-auth.json"
+        }
+    ]
+}
