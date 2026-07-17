@@ -1,4 +1,4 @@
-package main
+package providers
 
 import (
 	"context"
@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 func TestZAIProviderMapsQuotaWindows(t *testing.T) {
@@ -26,13 +25,7 @@ func TestZAIProviderMapsQuotaWindows(t *testing.T) {
 	if err := os.WriteFile(authPath, []byte(`{"access_token":"zai-token"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-
-	service := newUsageServiceWithPlans([]planConfig{{
-		Provider: "zai", Plan: "zai_plan_01",
-		Models:   []modelMapping{{LiteLLMName: "zai/glm-5"}},
-		UsageURL: upstream.URL, AuthFile: authPath,
-	}}, time.Minute, upstream.Client())
-	usage, err := service.retrieve(context.Background(), "zai/glm-5")
+	usage, err := Fetch(context.Background(), upstream.Client(), Plan{Provider: "zai", Plan: "zai_plan_01", UsageURL: upstream.URL, AuthFile: authPath})
 	if err != nil {
 		t.Fatal(err)
 	}

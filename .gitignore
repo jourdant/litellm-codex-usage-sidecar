@@ -1,5 +1,5 @@
 # Go build and test artifacts
-/codex-usage
+/litellm-subscription-usage-sidecar
 *.test
 *.out
 coverage.*

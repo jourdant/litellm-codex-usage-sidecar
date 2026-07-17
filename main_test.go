@@ -6,7 +6,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -72,6 +74,81 @@ func TestUsagePlansAndModelRouting(t *testing.T) {
 	}
 }
 
+func TestUsageQueryGroupsRequestedModelsByPlan(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false}}`))
+	}))
+	defer upstream.Close()
+
+	authPath := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(authPath, []byte(`{"access_token":"token","account_id":"account"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := newUsageServiceWithPlans([]planConfig{
+		{Provider: "openai", Plan: "openai_plan_01", Models: []modelMapping{{LiteLLMName: "oai-gpt-5.6-sol"}, {LiteLLMName: "oai-gpt-5.6-luna"}}, UsageURL: upstream.URL + "/openai", AuthFile: authPath},
+		{Provider: "openai", Plan: "zai_plan_01", Models: []modelMapping{{LiteLLMName: "glm-5.2"}}, UsageURL: upstream.URL + "/zai", AuthFile: authPath},
+	}, time.Minute, upstream.Client())
+	handler := newHandler("secret", service)
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/usage?m=oai-gpt-5.6-sol,glm-5.2,oai-gpt-5.6-luna", nil)
+	request.Header.Set("X-Internal-API-Key", "secret")
+	result := httptest.NewRecorder()
+	handler.ServeHTTP(result, request)
+
+	var response apiUsageListEnvelope
+	if err := json.Unmarshal(result.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if result.Code != http.StatusOK || !response.IsSuccess || len(response.Data) != 2 {
+		t.Fatalf("unexpected query response: status=%d body=%s", result.Code, result.Body.String())
+	}
+	if response.Data[0].PlanID != "openai_plan_01" || !reflect.DeepEqual(response.Data[0].RequestedModels, []string{"oai-gpt-5.6-sol", "oai-gpt-5.6-luna"}) {
+		t.Fatalf("unexpected first plan result: %+v", response.Data[0])
+	}
+	if response.Data[1].PlanID != "zai_plan_01" || !reflect.DeepEqual(response.Data[1].RequestedModels, []string{"glm-5.2"}) {
+		t.Fatalf("unexpected second plan result: %+v", response.Data[1])
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("expected one upstream request per plan, got %d", requests.Load())
+	}
+}
+
+func TestUsageQueryValidationAndUnknownModel(t *testing.T) {
+	t.Parallel()
+
+	plan := planConfig{Provider: "openai", Plan: "openai_plan_01", Models: []modelMapping{{LiteLLMName: "known"}}, UsageURL: "https://example.com/usage", AuthFile: "/tokens/auth.json"}
+	service := &usageService{
+		plans: []planConfig{plan},
+		caches: map[string]*cacheEntry{
+			planCacheKey(plan): {value: usageResponse{PlanType: "pro", RetrievedAt: "2026-07-17T00:00:00Z"}, expires: time.Now().Add(time.Minute)},
+		},
+	}
+	handler := newHandler("secret", service)
+
+	for _, target := range []string{"/v1/usage?m=", "/v1/usage?m=known,", "/v1/usage?m=known,,other"} {
+		request := httptest.NewRequest(http.MethodGet, target, nil)
+		request.Header.Set("X-Internal-API-Key", "secret")
+		result := httptest.NewRecorder()
+		handler.ServeHTTP(result, request)
+		if result.Code != http.StatusBadRequest {
+			t.Fatalf("target %q: expected 400, got status=%d body=%s", target, result.Code, result.Body.String())
+		}
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/usage?m=known,unknown", nil)
+	request.Header.Set("X-Internal-API-Key", "secret")
+	result := httptest.NewRecorder()
+	handler.ServeHTTP(result, request)
+	if result.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got status=%d body=%s", result.Code, result.Body.String())
+	}
+}
+
 func TestValidateProvidersConfigRejectsUnknownProvider(t *testing.T) {
 	t.Parallel()
 
@@ -83,15 +160,39 @@ func TestValidateProvidersConfigRejectsUnknownProvider(t *testing.T) {
 	}
 }
 
-func TestLoadProviderConfigAndMultiplePlans(t *testing.T) {
+func TestLoadLiteLLMConfigGroupsAnchoredModelMetadata(t *testing.T) {
 	t.Parallel()
 
-	configPath := filepath.Join(t.TempDir(), "providers.json")
-	configJSON := `{"plans":[{"provider":"openai","plan":"openai_plan_01","models":[{"litellm_name":"openai/free"}],"auth_file":"/tokens/free.json"},{"provider":"openai","plan":"openai_plan_02","models":[{"litellm_name":"openai/team"}],"auth_file":"/tokens/team.json"}]}`
-	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configYAML := `subscription_usage_plans:
+	openai: &openai_plan
+		provider: openai
+		plan: openai_plan_01
+		auth_file: /tokens/openai.json
+		cache_ttl_seconds: 45
+	zai: &zai_plan
+		provider: zai
+		plan: zai_plan_01
+		auth_env: Z_AI_API_KEY
+model_list:
+	- model_name: oai-one
+		model_info:
+			subscription_usage: *openai_plan
+	- model_name: oai-two
+		model_info:
+			subscription_usage: *openai_plan
+	- model_name: glm-one
+		model_info:
+			subscription_usage: *zai_plan
+	- model_name: embedding
+		model_info:
+			mode: embedding
+`
+	configYAML = strings.ReplaceAll(configYAML, "\t", "  ")
+	if err := os.WriteFile(configPath, []byte(configYAML), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	config, err := loadProviderConfig(configPath)
+	config, err := loadLiteLLMConfig(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +200,7 @@ func TestLoadProviderConfigAndMultiplePlans(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plans) != 2 || plans[0].Provider != "openai" || plans[1].Plan != "openai_plan_02" || plans[1].Models[0].LiteLLMName != "openai/team" || plans[1].AuthFile != "/tokens/team.json" {
+	if len(plans) != 2 || plans[0].Provider != "openai" || plans[0].Plan != "openai_plan_01" || len(plans[0].Models) != 2 || plans[0].Models[1].LiteLLMName != "oai-two" || plans[0].AuthFile != "/tokens/openai.json" || plans[0].CacheTTLSeconds != 45 || plans[1].Provider != "zai" || plans[1].Models[0].LiteLLMName != "glm-one" || plans[1].AuthEnv != "Z_AI_API_KEY" {
 		t.Fatalf("unexpected plans: %+v", plans)
 	}
 }

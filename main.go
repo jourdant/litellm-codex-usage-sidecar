@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,12 +15,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gopkg.in/yaml.v3"
+	"litellm-subscription-usage-sidecar/providers"
 )
 
 const (
 	protocolVersion      = "2025-11-25"
-	defaultModelPlanFile = "/data/model-plans.json"
+	defaultLiteLLMConfig = "/data/litellm-config.yaml"
 	defaultCacheTTL      = 60 * time.Second
+	maxRequestedModels   = 50
 )
 
 var errUnknownModel = errors.New("unknown model")
@@ -30,67 +33,36 @@ type providersConfig struct {
 	Plans []planConfig `json:"plans"`
 }
 
-type authFile struct {
-	AccessToken string `json:"access_token"`
-	AccountID   string `json:"account_id"`
+type liteLLMConfig struct {
+	ModelList []liteLLMModel `yaml:"model_list"`
 }
 
-type upstreamWindow struct {
-	UsedPercent float64 `json:"used_percent"`
-	ResetAt     int64   `json:"reset_at"`
+type liteLLMModel struct {
+	ModelName string           `yaml:"model_name"`
+	ModelInfo liteLLMModelInfo `yaml:"model_info"`
 }
 
-type upstreamRateLimit struct {
-	Allowed         bool            `json:"allowed"`
-	LimitReached    bool            `json:"limit_reached"`
-	PrimaryWindow   *upstreamWindow `json:"primary_window"`
-	SecondaryWindow *upstreamWindow `json:"secondary_window"`
+type liteLLMModelInfo struct {
+	SubscriptionUsage *subscriptionUsageConfig `yaml:"subscription_usage"`
 }
 
-type upstreamAdditionalLimit struct {
-	LimitName      string            `json:"limit_name"`
-	MeteredFeature string            `json:"metered_feature"`
-	RateLimit      upstreamRateLimit `json:"rate_limit"`
+type subscriptionUsageConfig struct {
+	Provider        string `yaml:"provider"`
+	Plan            string `yaml:"plan"`
+	AuthFile        string `yaml:"auth_file,omitempty"`
+	AuthEnv         string `yaml:"auth_env,omitempty"`
+	CacheTTLSeconds int    `yaml:"cache_ttl_seconds,omitempty"`
 }
 
-type upstreamUsage struct {
-	PlanType             string                    `json:"plan_type"`
-	RateLimit            upstreamRateLimit         `json:"rate_limit"`
-	AdditionalRateLimits []upstreamAdditionalLimit `json:"additional_rate_limits"`
-}
-
-type usageWindow struct {
-	UsedPercent      float64 `json:"used_percent"`
-	RemainingPercent float64 `json:"remaining_percent"`
-	ResetsAt         string  `json:"resets_at,omitempty"`
-}
-
-type usageLimit struct {
-	Name           string       `json:"name"`
-	MeteredFeature string       `json:"metered_feature,omitempty"`
-	Allowed        bool         `json:"allowed"`
-	LimitReached   bool         `json:"limit_reached"`
-	Primary        *usageWindow `json:"primary,omitempty"`
-	Secondary      *usageWindow `json:"secondary,omitempty"`
-}
-
-type usageResponse struct {
-	ModelID          string       `json:"model_id,omitempty"`
-	Provider         string       `json:"provider,omitempty"`
-	UsagePlanName    string       `json:"usage_plan_name,omitempty"`
-	PlanType         string       `json:"plan_type"`
-	Allowed          bool         `json:"allowed"`
-	LimitReached     bool         `json:"limit_reached"`
-	Primary          *usageWindow `json:"primary,omitempty"`
-	Secondary        *usageWindow `json:"secondary,omitempty"`
-	AdditionalLimits []usageLimit `json:"additional_limits,omitempty"`
-	RetrievedAt      string       `json:"retrieved_at"`
-}
+type usageWindow = providers.UsageWindow
+type usageLimit = providers.UsageLimit
+type usageResponse = providers.UsageResponse
 
 type usagePlan struct {
 	Provider        string         `json:"provider"`
 	Plan            string         `json:"plan"`
 	Models          []modelMapping `json:"models"`
+	RequestedModels []string       `json:"requested_models,omitempty"`
 	UsagePath       string         `json:"usage_path"`
 	PlanDetailsPath string         `json:"plan_details_path,omitempty"`
 	Usage           usageResponse  `json:"usage"`
@@ -109,13 +81,14 @@ type apiUsageEntry struct {
 }
 
 type apiUsageData struct {
-	Provider       string          `json:"provider"`
-	PlanID         string          `json:"plan_id"`
-	ExternalPlanID string          `json:"external_plan_id,omitempty"`
-	ModelID        string          `json:"model_id,omitempty"`
-	IsActive       bool            `json:"is_active"`
-	IsBlocked      bool            `json:"is_blocked"`
-	Usage          []apiUsageEntry `json:"usage"`
+	Provider        string          `json:"provider"`
+	PlanID          string          `json:"plan_id"`
+	ExternalPlanID  string          `json:"external_plan_id,omitempty"`
+	ModelID         string          `json:"model_id,omitempty"`
+	RequestedModels []string        `json:"requested_models,omitempty"`
+	IsActive        bool            `json:"is_active"`
+	IsBlocked       bool            `json:"is_blocked"`
+	Usage           []apiUsageEntry `json:"usage"`
 }
 
 type apiUsageEnvelope struct {
@@ -148,11 +121,12 @@ type modelMapping struct {
 }
 
 type planConfig struct {
-	Provider string         `json:"provider"`
-	Plan     string         `json:"plan"`
-	Models   []modelMapping `json:"models"`
-	AuthFile string         `json:"auth_file,omitempty"`
-	AuthEnv  string         `json:"auth_env,omitempty"`
+	Provider        string         `json:"provider"`
+	Plan            string         `json:"plan"`
+	Models          []modelMapping `json:"models"`
+	AuthFile        string         `json:"auth_file,omitempty"`
+	AuthEnv         string         `json:"auth_env,omitempty"`
+	CacheTTLSeconds int            `json:"cache_ttl_seconds,omitempty"`
 
 	UsageURL        string `json:"-"`
 	PlanDetailsPath string `json:"-"`
@@ -217,8 +191,15 @@ func (s *usageService) retrievePlanLocked(ctx context.Context, plan planConfig) 
 	if err != nil {
 		return usageResponse{}, err
 	}
-	s.caches[cacheKey] = &cacheEntry{value: value, expires: time.Now().Add(s.ttl)}
+	s.caches[cacheKey] = &cacheEntry{value: value, expires: time.Now().Add(s.cacheTTL(plan))}
 	return value, nil
+}
+
+func (s *usageService) cacheTTL(plan planConfig) time.Duration {
+	if plan.CacheTTLSeconds > 0 {
+		return time.Duration(plan.CacheTTLSeconds) * time.Second
+	}
+	return s.ttl
 }
 
 func (s *usageService) planForModel(modelID string) (planConfig, error) {
@@ -255,6 +236,62 @@ func (s *usageService) plansResponse(ctx context.Context) (usagePlansResponse, e
 	return usagePlansResponse(plans), nil
 }
 
+func (s *usageService) requestedModelsResponse(ctx context.Context, modelIDs []string) (usagePlansResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	planIndexes := make(map[string]int)
+	plans := make([]usagePlan, 0, len(modelIDs))
+	resolvedPlans := make([]planConfig, 0, len(modelIDs))
+	for _, modelID := range modelIDs {
+		plan, err := s.planForModel(modelID)
+		if err != nil {
+			return nil, err
+		}
+		key := planCacheKey(plan)
+		if index, exists := planIndexes[key]; exists {
+			plans[index].RequestedModels = append(plans[index].RequestedModels, modelID)
+			continue
+		}
+		planIndexes[key] = len(plans)
+		plans = append(plans, usagePlan{
+			Provider: planProvider(plan), Plan: plan.Plan,
+			RequestedModels: []string{modelID},
+		})
+		resolvedPlans = append(resolvedPlans, plan)
+	}
+
+	// Resolve all model names before making provider requests, so failures are atomic.
+	for index := range plans {
+		usage, err := s.retrievePlanLocked(ctx, resolvedPlans[index])
+		if err != nil {
+			return nil, err
+		}
+		plans[index].Usage = usage
+	}
+	return usagePlansResponse(plans), nil
+}
+
+func parseRequestedModels(values []string) ([]string, error) {
+	models := make([]string, 0)
+	for _, value := range values {
+		for _, model := range strings.Split(value, ",") {
+			model = strings.TrimSpace(model)
+			if model == "" {
+				return nil, errors.New("query parameter m contains an empty model name")
+			}
+			models = append(models, model)
+			if len(models) > maxRequestedModels {
+				return nil, fmt.Errorf("query parameter m supports at most %d model names", maxRequestedModels)
+			}
+		}
+	}
+	if len(models) == 0 {
+		return nil, errors.New("query parameter m requires at least one model name")
+	}
+	return models, nil
+}
+
 func planProvider(plan planConfig) string {
 	return strings.ToLower(strings.TrimSpace(plan.Provider))
 }
@@ -264,29 +301,61 @@ func planCacheKey(plan planConfig) string {
 }
 
 func (s *usageService) fetch(ctx context.Context, plan planConfig) (usageResponse, error) {
-	auth, err := readPlanAuth(plan)
-	if err != nil {
-		return usageResponse{}, err
-	}
-	provider, ok := providerAdapterFor(plan.Provider)
-	if !ok {
-		return usageResponse{}, fmt.Errorf("provider %q has no built-in adapter", plan.Provider)
-	}
-	return provider.fetch(ctx, s.client, plan, auth)
+	return providers.Fetch(ctx, s.client, providerPlan(plan))
 }
 
-func loadProviderConfig(path string) (providersConfig, error) {
+func providerPlan(plan planConfig) providers.Plan {
+	return providers.Plan{
+		Provider: planProvider(plan), Plan: plan.Plan, UsageURL: plan.UsageURL,
+		AuthFile: plan.AuthFile, AuthEnv: plan.AuthEnv,
+	}
+}
+
+func loadLiteLLMConfig(path string) (providersConfig, error) {
 	contents, err := os.ReadFile(path)
 	if err != nil {
-		return providersConfig{}, fmt.Errorf("read provider config: %w", err)
+		return providersConfig{}, fmt.Errorf("read LiteLLM config: %w", err)
 	}
 
-	var config providersConfig
-	if err := json.Unmarshal(contents, &config); err != nil {
-		return providersConfig{}, fmt.Errorf("parse provider config: %w", err)
+	var source liteLLMConfig
+	if err := yaml.Unmarshal(contents, &source); err != nil {
+		return providersConfig{}, fmt.Errorf("parse LiteLLM config: %w", err)
+	}
+
+	config := providersConfig{Plans: make([]planConfig, 0)}
+	planIndexes := make(map[string]int)
+	for _, model := range source.ModelList {
+		metadata := model.ModelInfo.SubscriptionUsage
+		if metadata == nil {
+			continue
+		}
+		modelName := strings.TrimSpace(model.ModelName)
+		provider := strings.ToLower(strings.TrimSpace(metadata.Provider))
+		planName := strings.TrimSpace(metadata.Plan)
+		if modelName == "" {
+			return providersConfig{}, errors.New("subscription-enabled model requires model_name")
+		}
+		key := provider + "\x00" + planName
+		if index, exists := planIndexes[key]; exists {
+			plan := &config.Plans[index]
+			if plan.AuthFile != metadata.AuthFile || plan.AuthEnv != metadata.AuthEnv || plan.CacheTTLSeconds != metadata.CacheTTLSeconds {
+				return providersConfig{}, fmt.Errorf("models on plan %q/%q must use identical subscription metadata", provider, planName)
+			}
+			plan.Models = append(plan.Models, modelMapping{LiteLLMName: modelName})
+			continue
+		}
+		planIndexes[key] = len(config.Plans)
+		config.Plans = append(config.Plans, planConfig{
+			Provider:        provider,
+			Plan:            planName,
+			Models:          []modelMapping{{LiteLLMName: modelName}},
+			AuthFile:        metadata.AuthFile,
+			AuthEnv:         metadata.AuthEnv,
+			CacheTTLSeconds: metadata.CacheTTLSeconds,
+		})
 	}
 	if err := validateProvidersConfig(config); err != nil {
-		return providersConfig{}, fmt.Errorf("validate provider config: %w", err)
+		return providersConfig{}, fmt.Errorf("validate LiteLLM subscription metadata: %w", err)
 	}
 	return config, nil
 }
@@ -301,7 +370,7 @@ func validateProvidersConfig(config providersConfig) error {
 		if provider == "" {
 			return errors.New("each plan requires provider")
 		}
-		if _, ok := providerAdapterFor(provider); !ok {
+		if _, ok := providers.DefinitionFor(provider); !ok {
 			return fmt.Errorf("provider %q has no built-in definition", provider)
 		}
 		if plan.Plan == "" {
@@ -309,6 +378,9 @@ func validateProvidersConfig(config providersConfig) error {
 		}
 		if (plan.AuthFile == "") == (plan.AuthEnv == "") {
 			return fmt.Errorf("plan %q requires exactly one of auth_file or auth_env", plan.Plan)
+		}
+		if plan.CacheTTLSeconds < 0 {
+			return fmt.Errorf("plan %q cache_ttl_seconds cannot be negative", plan.Plan)
 		}
 		if len(plan.Models) == 0 {
 			return fmt.Errorf("plan %q must list at least one model", plan.Plan)
@@ -332,11 +404,10 @@ func loadPlans(config providersConfig) ([]planConfig, error) {
 	}
 	for index := range config.Plans {
 		provider := planProvider(config.Plans[index])
-		adapter, ok := providerAdapterFor(provider)
+		definition, ok := providers.DefinitionFor(provider)
 		if !ok {
 			return nil, fmt.Errorf("provider %q has no built-in definition", provider)
 		}
-		definition := adapter.definition()
 		config.Plans[index].Provider = provider
 		config.Plans[index].UsageURL = definition.UsageURL
 		config.Plans[index].PlanDetailsPath = definition.PlanDetailsPath
@@ -358,7 +429,7 @@ func validatePlans(plans []planConfig) error {
 		if plan.Provider == "" {
 			return errors.New("each plan requires provider")
 		}
-		if _, ok := providerAdapterFor(planProvider(plan)); !ok {
+		if _, ok := providers.DefinitionFor(planProvider(plan)); !ok {
 			return fmt.Errorf("provider %q has no built-in definition", plan.Provider)
 		}
 		if plan.Plan == "" {
@@ -366,6 +437,9 @@ func validatePlans(plans []planConfig) error {
 		}
 		if (plan.AuthFile == "") == (plan.AuthEnv == "") {
 			return fmt.Errorf("plan %q requires exactly one of auth_file or auth_env", plan.Plan)
+		}
+		if plan.CacheTTLSeconds < 0 {
+			return fmt.Errorf("plan %q cache_ttl_seconds cannot be negative", plan.Plan)
 		}
 		planKey := planCacheKey(plan)
 		if _, exists := planKeys[planKey]; exists {
@@ -390,34 +464,6 @@ func validatePlans(plans []planConfig) error {
 		}
 	}
 	return nil
-}
-
-func normalizeUsage(upstream upstreamUsage, retrievedAt time.Time) usageResponse {
-	additional := make([]usageLimit, 0, len(upstream.AdditionalRateLimits))
-	for _, limit := range upstream.AdditionalRateLimits {
-		additional = append(additional, usageLimit{
-			Name: limit.LimitName, MeteredFeature: limit.MeteredFeature,
-			Allowed: limit.RateLimit.Allowed, LimitReached: limit.RateLimit.LimitReached,
-			Primary: normalizeWindow(limit.RateLimit.PrimaryWindow), Secondary: normalizeWindow(limit.RateLimit.SecondaryWindow),
-		})
-	}
-	return usageResponse{
-		PlanType: upstream.PlanType, Allowed: upstream.RateLimit.Allowed, LimitReached: upstream.RateLimit.LimitReached,
-		Primary: normalizeWindow(upstream.RateLimit.PrimaryWindow), Secondary: normalizeWindow(upstream.RateLimit.SecondaryWindow),
-		AdditionalLimits: additional, RetrievedAt: retrievedAt.Format(time.RFC3339),
-	}
-}
-
-func normalizeWindow(window *upstreamWindow) *usageWindow {
-	if window == nil {
-		return nil
-	}
-	used := math.Max(0, math.Min(100, window.UsedPercent))
-	reset := ""
-	if window.ResetAt > 0 {
-		reset = time.Unix(window.ResetAt, 0).UTC().Format(time.RFC3339)
-	}
-	return &usageWindow{UsedPercent: used, RemainingPercent: 100 - used, ResetsAt: reset}
 }
 
 func normalizeUsageData(usage usageResponse) apiUsageData {
@@ -503,6 +549,7 @@ func usageListEnvelope(plans usagePlansResponse) apiUsageListEnvelope {
 		if item.PlanID == "" {
 			item.PlanID = plan.Plan
 		}
+		item.RequestedModels = plan.RequestedModels
 		items = append(items, item)
 		if plan.Usage.RetrievedAt != "" {
 			retrievedAt = plan.Usage.RetrievedAt
@@ -560,8 +607,23 @@ func newHandler(internalKey string, service *usageService) http.Handler {
 		writeJSON(w, http.StatusOK, usageEnvelope(usage))
 	}))
 	mux.HandleFunc("GET /v1/usage", authenticate(internalKey, func(w http.ResponseWriter, r *http.Request) {
-		plans, err := service.plansResponse(r.Context())
+		var plans usagePlansResponse
+		var err error
+		if values, requested := r.URL.Query()["m"]; requested {
+			models, parseErr := parseRequestedModels(values)
+			if parseErr != nil {
+				writeJSON(w, http.StatusBadRequest, errorEnvelope(parseErr.Error()))
+				return
+			}
+			plans, err = service.requestedModelsResponse(r.Context(), models)
+		} else {
+			plans, err = service.plansResponse(r.Context())
+		}
 		if err != nil {
+			if errors.Is(err, errUnknownModel) {
+				writeJSON(w, http.StatusNotFound, errorEnvelope(err.Error()))
+				return
+			}
 			slog.Error("plan usage retrieval failed", "error", err)
 			writeJSON(w, http.StatusBadGateway, errorEnvelope("usage retrieval failed: "+err.Error()))
 			return
@@ -695,11 +757,11 @@ func main() {
 		slog.Error("INTERNAL_API_KEY is required")
 		os.Exit(1)
 	}
-	configPath := os.Getenv("SUBSCRIPTION_USAGE_CONFIG_FILE")
+	configPath := os.Getenv("LITELLM_CONFIG_FILE")
 	if configPath == "" {
-		configPath = defaultModelPlanFile
+		configPath = defaultLiteLLMConfig
 	}
-	config, err := loadProviderConfig(configPath)
+	config, err := loadLiteLLMConfig(configPath)
 	if err != nil {
 		slog.Error("invalid provider configuration", "error", err)
 		os.Exit(1)

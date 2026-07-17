@@ -81,6 +81,7 @@ The adapter supports three upstream response families:
 ```
 
 For Kimi usages responses, `usage` is mapped as the weekly window and any `limits[]` entry with `{duration: 300, timeUnit: TIME_UNIT_MINUTE}` is mapped as the five-hour window.
+Kimi may omit `usage.used`; in that case the adapter derives it as `limit - remaining`.
 
 For quota responses, TOKENS_LIMIT windows map to primary (unit 3) and secondary (unit 6), with percentage values clamped to 0-100 and nextResetTime normalized from epoch milliseconds to RFC 3339.
 

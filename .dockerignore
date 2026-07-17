@@ -1,3 +1,6 @@
 *
 !go.mod
-!main.go
+!go.sum
+!*.go
+!providers/
+!providers/*.go

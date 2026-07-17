@@ -1,4 +1,4 @@
-package main
+package providers
 
 import (
 	"context"
@@ -28,46 +28,40 @@ type zaiLimit struct {
 	NextResetAt  int64   `json:"nextResetTime"`
 }
 
-func (zaiProvider) definition() providerDefinition {
-	return providerDefinition{
+func (zaiProvider) definition() Definition {
+	return Definition{
 		UsageURL:        "https://api.z.ai/api/monitor/usage/quota/limit",
 		PlanDetailsPath: "/api/biz/subscription/list",
 	}
 }
 
-func (p zaiProvider) fetch(ctx context.Context, client *http.Client, plan planConfig, auth authFile) (usageResponse, error) {
+func (p zaiProvider) fetch(ctx context.Context, client *http.Client, plan Plan, auth authFile) (UsageResponse, error) {
 	endpoint := plan.UsageURL
 	if endpoint == "" {
 		endpoint = p.definition().UsageURL
 	}
 	body, err := providerGET(ctx, client, endpoint, auth.AccessToken, nil)
 	if err != nil {
-		return usageResponse{}, err
+		return UsageResponse{}, err
 	}
-
 	var upstream zaiQuotaResponse
 	if err := json.Unmarshal(body, &upstream); err != nil {
-		return usageResponse{}, fmt.Errorf("decode z.ai usage response: %w", err)
+		return UsageResponse{}, fmt.Errorf("decode z.ai usage response: %w", err)
 	}
 	if !upstream.Success && upstream.Message != "" {
-		return usageResponse{}, fmt.Errorf("z.ai usage unavailable: %s", upstream.Message)
+		return UsageResponse{}, fmt.Errorf("z.ai usage unavailable: %s", upstream.Message)
 	}
-
-	usage := usageResponse{
-		Provider:      planProvider(plan),
-		UsagePlanName: plan.Plan,
-		PlanType:      plan.Plan,
-		Allowed:       true,
-		RetrievedAt:   time.Now().UTC().Format(time.RFC3339),
+	usage := UsageResponse{
+		Provider: normalizeProvider(plan.Provider), UsagePlanName: plan.Plan, PlanType: plan.Plan,
+		Allowed: true, RetrievedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	for _, limit := range upstream.Data.Limits {
 		if limit.Type != "TOKENS_LIMIT" {
 			continue
 		}
-		window := &usageWindow{
-			UsedPercent:      clampPercent(limit.Percentage),
-			RemainingPercent: 100 - clampPercent(limit.Percentage),
-			ResetsAt:         formatEpochMilliseconds(limit.NextResetAt),
+		window := &UsageWindow{
+			UsedPercent: clampPercent(limit.Percentage), RemainingPercent: 100 - clampPercent(limit.Percentage),
+			ResetsAt: formatEpochMilliseconds(limit.NextResetAt),
 		}
 		if limit.Unit == 3 {
 			usage.Primary = window
@@ -76,7 +70,7 @@ func (p zaiProvider) fetch(ctx context.Context, client *http.Client, plan planCo
 		}
 	}
 	if usage.Primary == nil && usage.Secondary == nil {
-		return usageResponse{}, fmt.Errorf("z.ai usage response contained no token limits")
+		return UsageResponse{}, fmt.Errorf("z.ai usage response contained no token limits")
 	}
 	return usage, nil
 }

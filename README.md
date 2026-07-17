@@ -6,6 +6,7 @@ Small, stateless REST and Streamable HTTP MCP service for provider-specific mode
 
 - `GET /health`
 - `GET /v1/usage`
+- `GET /v1/usage?m={model_id},{model_id}`
 - `GET /v1/usage/{model_id}`
 - `POST /mcp`
 
@@ -32,7 +33,37 @@ Small, stateless REST and Streamable HTTP MCP service for provider-specific mode
 
 `GET /v1/usage/{model_id}` resolves the LiteLLM model name to its configured plan, fetches that plan's usage endpoint, and returns the same standardized envelope with a single normalized `data` object. Unknown model names return `404` with the same envelope shape and `is_success: false`.
 
-The service reads each plan's `auth_file` on every uncached retrieval so token refreshes are picked up without restarting. The last successful response is cached in memory for 60 seconds by default per provider plan endpoint. Requests for multiple LiteLLM model names that resolve to the same plan reuse that response; expired entries trigger a fresh provider request. Set `CACHE_TTL_SECONDS` to change the cache duration.
+`GET /v1/usage?m=oai-gpt-5.6-sol,glm-5.2` resolves a comma-delimited list of LiteLLM model names and returns one `data` object per linked provider plan. Each object includes `requested_models`, containing the requested model names linked to that result. Results preserve the order in which each plan first appears, and model names preserve request order within their plan:
+
+```json
+{
+	"is_success": true,
+	"message": "OK",
+	"retrieved_at": "2026-07-17T12:34:56Z",
+	"data": [
+		{
+			"provider": "openai",
+			"plan_id": "openai_plan_01",
+			"requested_models": ["oai-gpt-5.6-sol", "oai-gpt-5.6-luna"],
+			"is_active": true,
+			"is_blocked": false,
+			"usage": []
+		},
+		{
+			"provider": "zai",
+			"plan_id": "zai_plan_01",
+			"requested_models": ["glm-5.2"],
+			"is_active": true,
+			"is_blocked": false,
+			"usage": []
+		}
+	]
+}
+```
+
+The query accepts at most 50 model names. Empty names return `400`, and any unknown model makes the request fail atomically with `404` before provider usage is fetched. Omitting `m` retains the unfiltered one-result-per-configured-plan response.
+
+The service reads each plan's `auth_file` on every uncached retrieval so token refreshes are picked up without restarting. The last successful response is cached in memory for 60 seconds by default per provider plan endpoint. A later request for any other model linked to that same plan reuses the cached upstream result; expired entries trigger a fresh provider request. Set `cache_ttl_seconds` on a subscription usage plan for a per-plan override, or set `CACHE_TTL_SECONDS` for the service-wide fallback.
 
 ## Usage response
 
@@ -76,44 +107,36 @@ The sidecar currently implements three providers; their endpoint behavior, expec
 
 ## Provider plans
 
-For this Docker deployment, edit `../../data/litellm-subscription-usage-sidecar/model-plans.json` from the sidecar repository root. Docker mounts that file into the container as `/data/model-plans.json`. A provider can have multiple plans, and each plan owns its own identity (`auth_file`) and model entries. Each model entry is intentionally an object containing LiteLLM's public `model_name` as `litellm_name`, leaving room for future model-specific metadata. No provider model ID is required because the WHAM response reports account-wide usage rather than per-model limits, and wildcard entries are not supported. There is no separate plan ID: the provider and plan name identify a configured usage source, and each LiteLLM model name must appear in at most one plan. Provider endpoint behavior is built into the sidecar, so changing provider URLs is not required for the supported provider implementation:
+The read-only LiteLLM YAML is the source of truth for model-to-plan mappings. Define reusable subscription usage objects near the top of `../../data/litellm/config.yaml` and reference them from `model_info.subscription_usage` using YAML anchors. This keeps plan identity and authentication metadata in one place while linking each public LiteLLM `model_name` to its plan:
 
-```json
-{
-	"plans": [
-		{
-			"provider": "openai",
-			"plan": "openai_plan_01",
-			"models": [
-				{"litellm_name": "oai-gpt-5.5"},
-				{"litellm_name": "oai-gpt-5.6-luna"}
-			],
-			"auth_file": "/tokens/openai-default.json"
-		},
-		{
-			"provider": "openai",
-			"plan": "openai_plan_02",
-			"models": [
-				{"litellm_name": "oai-gpt-5.6-sol"}
-			],
-			"auth_file": "/tokens/openai-team.json"
-		},
-		{
-			"provider": "kimi",
-			"plan": "kimi_code_plan_01",
-			"models": [
-				{"litellm_name": "kimi-k2.7-code"},
-				{"litellm_name": "kimi-k3"},
-				{"litellm_name": "kimi-3"},
-				{"litellm_name": "Kimi-3"}
-			],
-			"auth_env": "KIMI_CODE_API_KEY"
-		}
-	]
-}
+```yaml
+subscription_usage_plans:
+  openai: &subscription_usage_openai
+    provider: openai
+    plan: openai_plan_01
+    auth_file: /tokens/auth.json
+		cache_ttl_seconds: 90
+  zai: &subscription_usage_zai
+    provider: zai
+    plan: zai_plan_01
+    auth_env: Z_AI_API_KEY
+
+model_list:
+  - model_name: oai-gpt-5.6-sol
+    model_info:
+      subscription_usage: *subscription_usage_openai
+      mode: responses
+    litellm_params:
+      model: chatgpt/gpt-5.6-sol
+
+  - model_name: glm-5.2
+    model_info:
+      subscription_usage: *subscription_usage_zai
+    litellm_params:
+      model: zai/glm-5.2
 ```
 
-Provider values should be LiteLLM provider IDs. The sidecar currently implements `openai`, `kimi`, and `zai`; provider-specific endpoint behavior is built into the sidecar, while plan identities and LiteLLM model mappings are user configuration. The OpenAI adapter is in `provider_openai.go`, the Kimi adapter is in `provider_kimi.go`, and the z.ai adapter is in `provider_zai.go`.
+Models without `model_info.subscription_usage` are ignored. Models that resolve to the same provider and plan are grouped automatically and must resolve to identical subscription metadata. Exactly one authentication source is required. `cache_ttl_seconds` is optional and must be positive when specified; omission uses the service default of 60 seconds. Provider values should be LiteLLM provider IDs. The sidecar currently implements `openai`, `kimi`, and `zai`; provider endpoint behavior remains built into the sidecar.
 
 `plan_details_path` is returned as provider metadata for consumers that need to build a provider-specific plan-details request. It is controlled by the built-in provider adapter rather than the editable plan file. The sidecar currently fetches usage only; it does not fetch or proxy plan details separately.
 
@@ -121,15 +144,15 @@ Provider values should be LiteLLM provider IDs. The sidecar currently implements
 
 ```
 main.go                                         # HTTP server, MCP handler, usage service, config loading, normalization
-provider.go                                     # provider adapter interface and dispatch
-provider_openai.go                              # OpenAI (ChatGPT Codex WHAM) adapter
-provider_kimi.go                                # Kimi (Kimi Code usage) adapter
-provider_zai.go                                 # z.ai (GLM Coding Plan quota) adapter
-../../data/litellm-subscription-usage-sidecar/model-plans.json  # mounted provider/plan/model configuration
+providers/provider.go                           # provider facade, shared types, authentication, and HTTP handling
+providers/provider_openai.go                    # OpenAI (ChatGPT Codex WHAM) adapter
+providers/provider_kimi.go                      # Kimi (Kimi Code usage) adapter
+providers/provider_zai.go                       # z.ai (GLM Coding Plan quota) adapter
+../../data/litellm/config.yaml                  # mounted LiteLLM model and subscription metadata
 docs/                                           # per-provider documentation (endpoints, response shapes, normalization)
 ```
 
-Tests mirror this layout: `main_test.go` covers routing, config, and the MCP handler; `provider_openai_test.go`, `provider_kimi_test.go`, and `provider_zai_test.go` cover the adapter fetch paths.
+Tests mirror this layout: `main_test.go` covers routing, config, and the MCP handler; `usage_service_test.go` covers application-level caching and defaults; provider adapter tests live beside their implementations under `providers/`.
 
 ## LiteLLM rollout
 
@@ -168,6 +191,6 @@ Then add a `litellm-subscription-usage-sidecar` healthy dependency to `litellm`,
 ## Environment
 
 - `INTERNAL_API_KEY` is required for authenticated endpoints.
-- `SUBSCRIPTION_USAGE_CONFIG_FILE` defaults to `/data/model-plans.json`.
+- `LITELLM_CONFIG_FILE` defaults to `/data/litellm-config.yaml`.
 - `CACHE_TTL_SECONDS` defaults to `60` seconds and controls the in-memory provider response cache.
 - `UPSTREAM_TIMEOUT_SECONDS` defaults to `10`.
