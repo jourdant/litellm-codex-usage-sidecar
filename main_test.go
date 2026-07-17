@@ -118,7 +118,7 @@ func TestUsageQueryGroupsRequestedModelsByPlan(t *testing.T) {
 	}
 }
 
-func TestUsageQueryValidationAndUnknownModel(t *testing.T) {
+func TestUsageQueryValidationAndUnlinkedModels(t *testing.T) {
 	t.Parallel()
 
 	plan := planConfig{Provider: "openai", Plan: "openai_plan_01", Models: []modelMapping{{LiteLLMName: "known"}}, UsageURL: "https://example.com/usage", AuthFile: "/tokens/auth.json"}
@@ -144,8 +144,23 @@ func TestUsageQueryValidationAndUnknownModel(t *testing.T) {
 	request.Header.Set("X-Internal-API-Key", "secret")
 	result := httptest.NewRecorder()
 	handler.ServeHTTP(result, request)
-	if result.Code != http.StatusNotFound {
-		t.Fatalf("expected 404, got status=%d body=%s", result.Code, result.Body.String())
+	var response apiUsageListEnvelope
+	if err := json.Unmarshal(result.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if result.Code != http.StatusOK || len(response.Data) != 1 || !reflect.DeepEqual(response.Data[0].RequestedModels, []string{"known"}) {
+		t.Fatalf("expected only the linked model, got status=%d body=%s", result.Code, result.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/v1/usage?m=unknown,also-unknown", nil)
+	request.Header.Set("X-Internal-API-Key", "secret")
+	result = httptest.NewRecorder()
+	handler.ServeHTTP(result, request)
+	if err := json.Unmarshal(result.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if result.Code != http.StatusOK || !response.IsSuccess || len(response.Data) != 0 {
+		t.Fatalf("expected an empty successful result, got status=%d body=%s", result.Code, result.Body.String())
 	}
 }
 

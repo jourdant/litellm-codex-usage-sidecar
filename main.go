@@ -246,6 +246,9 @@ func (s *usageService) requestedModelsResponse(ctx context.Context, modelIDs []s
 	for _, modelID := range modelIDs {
 		plan, err := s.planForModel(modelID)
 		if err != nil {
+			if errors.Is(err, errUnknownModel) {
+				continue
+			}
 			return nil, err
 		}
 		key := planCacheKey(plan)
@@ -261,7 +264,6 @@ func (s *usageService) requestedModelsResponse(ctx context.Context, modelIDs []s
 		resolvedPlans = append(resolvedPlans, plan)
 	}
 
-	// Resolve all model names before making provider requests, so failures are atomic.
 	for index := range plans {
 		usage, err := s.retrievePlanLocked(ctx, resolvedPlans[index])
 		if err != nil {

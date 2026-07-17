@@ -61,7 +61,7 @@ Small, stateless REST and Streamable HTTP MCP service for provider-specific mode
 }
 ```
 
-The query accepts at most 50 model names. Empty names return `400`, and any unknown model makes the request fail atomically with `404` before provider usage is fetched. Omitting `m` retains the unfiltered one-result-per-configured-plan response.
+The query accepts at most 50 model names. Empty names return `400`. Model names without linked subscription metadata are ignored, so the response contains only plans linked to requested models; if none are linked, the endpoint returns a successful empty `data` array. Omitting `m` retains the unfiltered one-result-per-configured-plan response.
 
 The service reads each plan's `auth_file` on every uncached retrieval so token refreshes are picked up without restarting. The last successful response is cached in memory for 60 seconds by default per provider plan endpoint. A later request for any other model linked to that same plan reuses the cached upstream result; expired entries trigger a fresh provider request. Set `cache_ttl_seconds` on a subscription usage plan for a per-plan override, or set `CACHE_TTL_SECONDS` for the service-wide fallback.
 
