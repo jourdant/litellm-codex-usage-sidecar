@@ -24,6 +24,8 @@ func providerAdapterFor(provider string) (providerAdapter, bool) {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "openai":
 		return openaiProvider{}, true
+	case "kimi":
+		return kimiProvider{}, true
 	case "zai":
 		return zaiProvider{}, true
 	default:
@@ -47,6 +49,17 @@ func readAuthFile(path string) (authFile, error) {
 	return auth, nil
 }
 
+func readPlanAuth(plan planConfig) (authFile, error) {
+	if plan.AuthEnv != "" {
+		value := strings.TrimSpace(os.Getenv(plan.AuthEnv))
+		if value == "" {
+			return authFile{}, fmt.Errorf("environment variable %s is empty", plan.AuthEnv)
+		}
+		return authFile{AccessToken: value}, nil
+	}
+	return readAuthFile(plan.AuthFile)
+}
+
 func providerGET(ctx context.Context, client *http.Client, endpoint, authorization string, headers map[string]string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -54,7 +67,7 @@ func providerGET(ctx context.Context, client *http.Client, endpoint, authorizati
 	}
 	req.Header.Set("Authorization", authorization)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "codex-usage-sidecar/1")
+	req.Header.Set("User-Agent", "litellm-subscription-usage-sidecar/1")
 	for name, value := range headers {
 		req.Header.Set(name, value)
 	}

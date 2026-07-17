@@ -19,9 +19,9 @@ import (
 )
 
 const (
-	protocolVersion           = "2025-11-25"
-	defaultProviderConfigFile = "/config/providers.json"
-	defaultCacheTTL           = 60 * time.Second
+	protocolVersion      = "2025-11-25"
+	defaultModelPlanFile = "/data/model-plans.json"
+	defaultCacheTTL      = 60 * time.Second
 )
 
 var errUnknownModel = errors.New("unknown model")
@@ -98,6 +98,46 @@ type usagePlan struct {
 
 type usagePlansResponse []usagePlan
 
+type apiUsageEntry struct {
+	Type             string  `json:"type"`
+	Name             string  `json:"name"`
+	Period           string  `json:"period"`
+	UsedPercent      float64 `json:"used_percent"`
+	RemainingPercent float64 `json:"remaining_percent"`
+	StartAt          string  `json:"start_at,omitempty"`
+	ResetAt          string  `json:"reset_at,omitempty"`
+}
+
+type apiUsageData struct {
+	Provider       string          `json:"provider"`
+	PlanID         string          `json:"plan_id"`
+	ExternalPlanID string          `json:"external_plan_id,omitempty"`
+	ModelID        string          `json:"model_id,omitempty"`
+	IsActive       bool            `json:"is_active"`
+	IsBlocked      bool            `json:"is_blocked"`
+	Usage          []apiUsageEntry `json:"usage"`
+}
+
+type apiUsageEnvelope struct {
+	IsSuccess   bool         `json:"is_success"`
+	Message     string       `json:"message"`
+	RetrievedAt string       `json:"retrieved_at"`
+	Data        apiUsageData `json:"data"`
+}
+
+type apiUsageListEnvelope struct {
+	IsSuccess   bool           `json:"is_success"`
+	Message     string         `json:"message"`
+	RetrievedAt string         `json:"retrieved_at"`
+	Data        []apiUsageData `json:"data"`
+}
+
+type apiErrorEnvelope struct {
+	IsSuccess   bool   `json:"is_success"`
+	Message     string `json:"message"`
+	RetrievedAt string `json:"retrieved_at"`
+}
+
 type cacheEntry struct {
 	value   usageResponse
 	expires time.Time
@@ -111,7 +151,8 @@ type planConfig struct {
 	Provider string         `json:"provider"`
 	Plan     string         `json:"plan"`
 	Models   []modelMapping `json:"models"`
-	AuthFile string         `json:"auth_file"`
+	AuthFile string         `json:"auth_file,omitempty"`
+	AuthEnv  string         `json:"auth_env,omitempty"`
 
 	UsageURL        string `json:"-"`
 	PlanDetailsPath string `json:"-"`
@@ -219,11 +260,11 @@ func planProvider(plan planConfig) string {
 }
 
 func planCacheKey(plan planConfig) string {
-	return strings.Join([]string{planProvider(plan), plan.Plan, plan.UsageURL, plan.AuthFile}, "\x00")
+	return strings.Join([]string{planProvider(plan), plan.Plan, plan.UsageURL, plan.AuthFile, plan.AuthEnv}, "\x00")
 }
 
 func (s *usageService) fetch(ctx context.Context, plan planConfig) (usageResponse, error) {
-	auth, err := readAuthFile(plan.AuthFile)
+	auth, err := readPlanAuth(plan)
 	if err != nil {
 		return usageResponse{}, err
 	}
@@ -266,8 +307,8 @@ func validateProvidersConfig(config providersConfig) error {
 		if plan.Plan == "" {
 			return fmt.Errorf("plan for provider %q requires plan", provider)
 		}
-		if plan.AuthFile == "" {
-			return fmt.Errorf("plan %q requires auth_file", plan.Plan)
+		if (plan.AuthFile == "") == (plan.AuthEnv == "") {
+			return fmt.Errorf("plan %q requires exactly one of auth_file or auth_env", plan.Plan)
 		}
 		if len(plan.Models) == 0 {
 			return fmt.Errorf("plan %q must list at least one model", plan.Plan)
@@ -323,8 +364,8 @@ func validatePlans(plans []planConfig) error {
 		if plan.Plan == "" {
 			return fmt.Errorf("plan for provider %q requires plan", plan.Provider)
 		}
-		if plan.AuthFile == "" {
-			return fmt.Errorf("plan %q requires auth_file because provider %q has no built-in auth file", plan.Plan, plan.Provider)
+		if (plan.AuthFile == "") == (plan.AuthEnv == "") {
+			return fmt.Errorf("plan %q requires exactly one of auth_file or auth_env", plan.Plan)
 		}
 		planKey := planCacheKey(plan)
 		if _, exists := planKeys[planKey]; exists {
@@ -379,6 +420,101 @@ func normalizeWindow(window *upstreamWindow) *usageWindow {
 	return &usageWindow{UsedPercent: used, RemainingPercent: 100 - used, ResetsAt: reset}
 }
 
+func normalizeUsageData(usage usageResponse) apiUsageData {
+	entries := make([]apiUsageEntry, 0, 2+(2*len(usage.AdditionalLimits)))
+	entries = appendWindowEntries(entries, "primary", usage.PlanType, usage.Primary, usage.Secondary)
+	for _, additional := range usage.AdditionalLimits {
+		typeName := additional.MeteredFeature
+		if typeName == "" {
+			typeName = additional.Name
+		}
+		if typeName == "" {
+			typeName = "additional"
+		}
+		name := additional.Name
+		if name == "" {
+			name = usage.PlanType
+		}
+		entries = appendWindowEntries(entries, typeName, name, additional.Primary, additional.Secondary)
+	}
+
+	planName := usage.UsagePlanName
+	if planName == "" {
+		planName = usage.PlanType
+	}
+
+	return apiUsageData{
+		Provider:  usage.Provider,
+		PlanID:    planName,
+		ModelID:   usage.ModelID,
+		IsActive:  usage.Allowed,
+		IsBlocked: !usage.Allowed || usage.LimitReached,
+		Usage:     entries,
+	}
+}
+
+func appendWindowEntries(entries []apiUsageEntry, typeName, name string, primary *usageWindow, secondary *usageWindow) []apiUsageEntry {
+	if primary != nil {
+		entries = append(entries, newUsageEntry(typeName, name, "5-hourly", 5*time.Hour, primary))
+	}
+	if secondary != nil {
+		entries = append(entries, newUsageEntry(typeName, name, "weekly", 7*24*time.Hour, secondary))
+	}
+	return entries
+}
+
+func newUsageEntry(typeName, name, period string, duration time.Duration, window *usageWindow) apiUsageEntry {
+	entry := apiUsageEntry{
+		Type:             typeName,
+		Name:             name,
+		Period:           period,
+		UsedPercent:      window.UsedPercent,
+		RemainingPercent: window.RemainingPercent,
+		ResetAt:          window.ResetsAt,
+	}
+	if duration <= 0 || window.ResetsAt == "" {
+		return entry
+	}
+	resetAt, err := time.Parse(time.RFC3339, window.ResetsAt)
+	if err != nil {
+		return entry
+	}
+	entry.StartAt = resetAt.Add(-duration).UTC().Format(time.RFC3339)
+	return entry
+}
+
+func usageEnvelope(usage usageResponse) apiUsageEnvelope {
+	return apiUsageEnvelope{
+		IsSuccess:   true,
+		Message:     "OK",
+		RetrievedAt: usage.RetrievedAt,
+		Data:        normalizeUsageData(usage),
+	}
+}
+
+func usageListEnvelope(plans usagePlansResponse) apiUsageListEnvelope {
+	items := make([]apiUsageData, 0, len(plans))
+	retrievedAt := time.Now().UTC().Format(time.RFC3339)
+	for _, plan := range plans {
+		item := normalizeUsageData(plan.Usage)
+		if item.Provider == "" {
+			item.Provider = plan.Provider
+		}
+		if item.PlanID == "" {
+			item.PlanID = plan.Plan
+		}
+		items = append(items, item)
+		if plan.Usage.RetrievedAt != "" {
+			retrievedAt = plan.Usage.RetrievedAt
+		}
+	}
+	return apiUsageListEnvelope{IsSuccess: true, Message: "OK", RetrievedAt: retrievedAt, Data: items}
+}
+
+func errorEnvelope(message string) apiErrorEnvelope {
+	return apiErrorEnvelope{IsSuccess: false, Message: message, RetrievedAt: time.Now().UTC().Format(time.RFC3339)}
+}
+
 type rpcRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`
@@ -399,7 +535,10 @@ type rpcResponse struct {
 }
 
 type toolCallParams struct {
-	Name string `json:"name"`
+	Name      string `json:"name"`
+	Arguments struct {
+		ModelID string `json:"model_id"`
+	} `json:"arguments"`
 }
 
 func newHandler(internalKey string, service *usageService) http.Handler {
@@ -411,23 +550,23 @@ func newHandler(internalKey string, service *usageService) http.Handler {
 		usage, err := service.retrieve(r.Context(), r.PathValue("model_id"))
 		if err != nil {
 			if errors.Is(err, errUnknownModel) {
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+				writeJSON(w, http.StatusNotFound, errorEnvelope(err.Error()))
 				return
 			}
 			slog.Error("usage retrieval failed", "error", err)
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "usage retrieval failed"})
+			writeJSON(w, http.StatusBadGateway, errorEnvelope("usage retrieval failed: "+err.Error()))
 			return
 		}
-		writeJSON(w, http.StatusOK, usage)
+		writeJSON(w, http.StatusOK, usageEnvelope(usage))
 	}))
 	mux.HandleFunc("GET /v1/usage", authenticate(internalKey, func(w http.ResponseWriter, r *http.Request) {
 		plans, err := service.plansResponse(r.Context())
 		if err != nil {
 			slog.Error("plan usage retrieval failed", "error", err)
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "usage retrieval failed"})
+			writeJSON(w, http.StatusBadGateway, errorEnvelope("usage retrieval failed: "+err.Error()))
 			return
 		}
-		writeJSON(w, http.StatusOK, plans)
+		writeJSON(w, http.StatusOK, usageListEnvelope(plans))
 	}))
 	mux.HandleFunc("POST /mcp", authenticate(internalKey, func(w http.ResponseWriter, r *http.Request) {
 		handleMCP(w, r, service)
@@ -448,7 +587,7 @@ func authenticate(key string, next http.HandlerFunc) http.HandlerFunc {
 
 func handleMCP(w http.ResponseWriter, r *http.Request, service *usageService) {
 	if r.Header.Get("Content-Type") != "application/json" {
-		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "Content-Type must be application/json"})
+		writeJSON(w, http.StatusUnsupportedMediaType, errorEnvelope("Content-Type must be application/json"))
 		return
 	}
 	var request rpcRequest
@@ -463,7 +602,7 @@ func handleMCP(w http.ResponseWriter, r *http.Request, service *usageService) {
 		writeRPC(w, request.ID, map[string]any{
 			"protocolVersion": protocolVersion,
 			"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
-			"serverInfo":      map[string]string{"name": "codex-usage", "version": "1.0.0"},
+			"serverInfo":      map[string]string{"name": "litellm-subscription-usage-sidecar", "version": "1.2.0"},
 		}, nil)
 	case "notifications/initialized":
 		w.WriteHeader(http.StatusAccepted)
@@ -471,23 +610,30 @@ func handleMCP(w http.ResponseWriter, r *http.Request, service *usageService) {
 		writeRPC(w, request.ID, map[string]any{}, nil)
 	case "tools/list":
 		writeRPC(w, request.ID, map[string]any{"tools": []any{map[string]any{
-			"name":        "get_codex_usage",
-			"description": "Get the shared ChatGPT account's current Codex allowance, remaining percentage, and reset times.",
-			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false},
+			"name":        "get_model_usage",
+			"description": "Get current provider allowance, remaining percentage, and reset times for a configured LiteLLM model.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"model_id": map[string]any{"type": "string", "description": "Configured LiteLLM model name"},
+				},
+				"required": []string{"model_id"}, "additionalProperties": false,
+			},
 		}}}, nil)
 	case "tools/call":
 		var params toolCallParams
-		if err := json.Unmarshal(request.Params, &params); err != nil || params.Name != "get_codex_usage" {
+		if err := json.Unmarshal(request.Params, &params); err != nil || params.Name != "get_model_usage" || params.Arguments.ModelID == "" {
 			writeRPC(w, request.ID, nil, &rpcError{Code: -32602, Message: "Invalid params"})
 			return
 		}
-		usage, err := service.retrieve(r.Context(), "")
+		usage, err := service.retrieve(r.Context(), params.Arguments.ModelID)
 		if err != nil {
 			slog.Error("MCP usage retrieval failed", "error", err)
 			writeRPC(w, request.ID, map[string]any{"isError": true, "content": []any{map[string]string{"type": "text", "text": "Usage retrieval failed"}}}, nil)
 			return
 		}
-		structured, _ := json.Marshal(usage)
+		payload := usageEnvelope(usage)
+		structured, _ := json.Marshal(payload)
 		writeRPC(w, request.ID, map[string]any{
 			"content":           []any{map[string]string{"type": "text", "text": summarizeUsage(usage)}},
 			"structuredContent": json.RawMessage(structured),
@@ -504,13 +650,13 @@ func handleMCP(w http.ResponseWriter, r *http.Request, service *usageService) {
 
 func summarizeUsage(usage usageResponse) string {
 	if usage.Primary == nil {
-		return fmt.Sprintf("Codex usage for the %s plan is available, but no primary allowance window was returned.", usage.PlanType)
+		return fmt.Sprintf("Usage for %s on the %s plan is available, but no primary allowance window was returned.", usage.ModelID, usage.PlanType)
 	}
 	reset := ""
 	if usage.Primary.ResetsAt != "" {
 		reset = "; resets at " + usage.Primary.ResetsAt
 	}
-	return fmt.Sprintf("Codex %s plan: %.0f%% remaining (%.0f%% used)%s.", usage.PlanType, usage.Primary.RemainingPercent, usage.Primary.UsedPercent, reset)
+	return fmt.Sprintf("%s (%s): %.0f%% remaining (%.0f%% used)%s.", usage.ModelID, usage.PlanType, usage.Primary.RemainingPercent, usage.Primary.UsedPercent, reset)
 }
 
 func writeRPC(w http.ResponseWriter, id json.RawMessage, result any, rpcErr *rpcError) {
@@ -549,9 +695,9 @@ func main() {
 		slog.Error("INTERNAL_API_KEY is required")
 		os.Exit(1)
 	}
-	configPath := os.Getenv("PROVIDER_CONFIG_FILE")
+	configPath := os.Getenv("SUBSCRIPTION_USAGE_CONFIG_FILE")
 	if configPath == "" {
-		configPath = defaultProviderConfigFile
+		configPath = defaultModelPlanFile
 	}
 	config, err := loadProviderConfig(configPath)
 	if err != nil {

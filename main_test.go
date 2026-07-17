@@ -39,11 +39,11 @@ func TestUsagePlansAndModelRouting(t *testing.T) {
 	plansRequest.Header.Set("X-Internal-API-Key", "secret")
 	plansResult := httptest.NewRecorder()
 	handler.ServeHTTP(plansResult, plansRequest)
-	var plans usagePlansResponse
+	var plans apiUsageListEnvelope
 	if err := json.Unmarshal(plansResult.Body.Bytes(), &plans); err != nil {
 		t.Fatal(err)
 	}
-	if plansResult.Code != http.StatusOK || len(plans) != 2 || plans[0].Provider != "openai" || plans[0].Usage.PlanType != "openai-plan" || plans[1].Models[0].LiteLLMName != "openai/team" || plans[1].Usage.Provider != "openai" {
+	if plansResult.Code != http.StatusOK || !plans.IsSuccess || len(plans.Data) != 2 || plans.Data[0].Provider != "openai" || plans.Data[0].PlanID != "openai_plan_01" || plans.Data[1].PlanID != "openai_plan_02" {
 		t.Fatalf("unexpected plans response: status=%d body=%s", plansResult.Code, plansResult.Body.String())
 	}
 
@@ -51,11 +51,11 @@ func TestUsagePlansAndModelRouting(t *testing.T) {
 	modelRequest.Header.Set("X-Internal-API-Key", "secret")
 	modelResult := httptest.NewRecorder()
 	handler.ServeHTTP(modelResult, modelRequest)
-	var usage usageResponse
+	var usage apiUsageEnvelope
 	if err := json.Unmarshal(modelResult.Body.Bytes(), &usage); err != nil {
 		t.Fatal(err)
 	}
-	if modelResult.Code != http.StatusOK || usage.ModelID != "openai/team" || usage.Provider != "openai" {
+	if modelResult.Code != http.StatusOK || !usage.IsSuccess || usage.Data.ModelID != "openai/team" || usage.Data.Provider != "openai" || usage.Data.PlanID != "openai_plan_02" {
 		t.Fatalf("unexpected model response: status=%d body=%s", modelResult.Code, modelResult.Body.String())
 	}
 
@@ -63,7 +63,11 @@ func TestUsagePlansAndModelRouting(t *testing.T) {
 	unknownRequest.Header.Set("X-Internal-API-Key", "secret")
 	unknownResult := httptest.NewRecorder()
 	handler.ServeHTTP(unknownResult, unknownRequest)
-	if unknownResult.Code != http.StatusNotFound {
+	var unknown apiErrorEnvelope
+	if err := json.Unmarshal(unknownResult.Body.Bytes(), &unknown); err != nil {
+		t.Fatal(err)
+	}
+	if unknownResult.Code != http.StatusNotFound || unknown.IsSuccess || unknown.Message == "" {
 		t.Fatalf("unknown model status=%d body=%s", unknownResult.Code, unknownResult.Body.String())
 	}
 }
@@ -103,7 +107,13 @@ func TestLoadProviderConfigAndMultiplePlans(t *testing.T) {
 func TestMCPInitializeAndToolCall(t *testing.T) {
 	t.Parallel()
 
-	service := &usageService{cache: &cacheEntry{value: usageResponse{PlanType: "pro", RetrievedAt: "2026-07-13T00:00:00Z"}, expires: time.Now().Add(time.Minute)}}
+	plan := planConfig{Provider: "openai", Plan: "openai_plan_01", Models: []modelMapping{{LiteLLMName: "oai-gpt-5.5"}}, UsageURL: "https://example.com/usage", AuthFile: "/tokens/auth.json"}
+	service := &usageService{
+		plans: []planConfig{plan},
+		caches: map[string]*cacheEntry{
+			planCacheKey(plan): {value: usageResponse{PlanType: "pro", RetrievedAt: "2026-07-13T00:00:00Z"}, expires: time.Now().Add(time.Minute)},
+		},
+	}
 	handler := newHandler("secret", service)
 
 	initializeBody := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`
@@ -116,7 +126,7 @@ func TestMCPInitializeAndToolCall(t *testing.T) {
 		t.Fatalf("initialize status=%d body=%s", initializeResult.Code, initializeResult.Body.String())
 	}
 
-	callBody := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_codex_usage","arguments":{}}}`
+	callBody := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_model_usage","arguments":{"model_id":"oai-gpt-5.5"}}}`
 	call := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(callBody))
 	call.Header.Set("X-Internal-API-Key", "secret")
 	call.Header.Set("Content-Type", "application/json")
